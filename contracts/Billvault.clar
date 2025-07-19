@@ -10,9 +10,15 @@
 (define-constant ERR_ORACLE_UNAUTHORIZED (err u108))
 (define-constant ERR_INVALID_USAGE (err u109))
 (define-constant ERR_POOL_FULL (err u110))
+(define-constant ERR_SCHEDULE_NOT_FOUND (err u111))
+(define-constant ERR_SCHEDULE_INACTIVE (err u112))
+(define-constant ERR_SCHEDULE_NOT_DUE (err u113))
+(define-constant ERR_INVALID_FREQUENCY (err u114))
+(define-constant ERR_SCHEDULE_EXISTS (err u115))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-bill-id uint u1)
+(define-data-var next-schedule-id uint u1)
 
 (define-map pools
   { pool-id: uint }
@@ -63,6 +69,30 @@
 (define-map authorized-oracles
   { oracle: principal }
   { authorized: bool }
+)
+
+(define-map payment-schedules
+  { schedule-id: uint }
+  {
+    pool-id: uint,
+    frequency-blocks: uint,
+    expected-amount: uint,
+    next-payment-block: uint,
+    active: bool,
+    created-at: uint,
+    last-executed: uint,
+    auto-execute: bool
+  }
+)
+
+(define-map schedule-history
+  { schedule-id: uint, execution-id: uint }
+  {
+    executed-at: uint,
+    amount-paid: uint,
+    bill-id: uint,
+    success: bool
+  }
 )
 
 (define-public (create-pool (name (string-ascii 50)) (max-members uint) (utility-type (string-ascii 20)) (oracle principal))
@@ -253,6 +283,192 @@
   )
 )
 
+(define-public (create-payment-schedule (pool-id uint) (frequency-blocks uint) (expected-amount uint) (auto-execute bool))
+  (let
+    (
+      (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (schedule-id (var-get next-schedule-id))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (asserts! (> frequency-blocks u0) ERR_INVALID_FREQUENCY)
+    (asserts! (> expected-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (get-active-schedule-for-pool pool-id)) ERR_SCHEDULE_EXISTS)
+    (map-set payment-schedules
+      { schedule-id: schedule-id }
+      {
+        pool-id: pool-id,
+        frequency-blocks: frequency-blocks,
+        expected-amount: expected-amount,
+        next-payment-block: (+ stacks-block-height frequency-blocks),
+        active: true,
+        created-at: stacks-block-height,
+        last-executed: u0,
+        auto-execute: auto-execute
+      }
+    )
+    (var-set next-schedule-id (+ schedule-id u1))
+    (ok schedule-id)
+  )
+)
+
+(define-public (execute-scheduled-payment (schedule-id uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? payment-schedules { schedule-id: schedule-id }) ERR_SCHEDULE_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id schedule) }) ERR_POOL_NOT_FOUND))
+      (bill-id (var-get next-bill-id))
+    )
+    (asserts! (get active schedule) ERR_SCHEDULE_INACTIVE)
+    (asserts! (>= stacks-block-height (get next-payment-block schedule)) ERR_SCHEDULE_NOT_DUE)
+    (asserts! (>= (get total-balance pool) (get expected-amount schedule)) ERR_INSUFFICIENT_BALANCE)
+    (try! (create-and-pay-scheduled-bill schedule-id bill-id))
+    (map-set payment-schedules
+      { schedule-id: schedule-id }
+      (merge schedule 
+        {
+          next-payment-block: (+ stacks-block-height (get frequency-blocks schedule)),
+          last-executed: stacks-block-height
+        }
+      )
+    )
+    (ok bill-id)
+  )
+)
+
+(define-public (toggle-schedule-status (schedule-id uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? payment-schedules { schedule-id: schedule-id }) ERR_SCHEDULE_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id schedule) }) ERR_POOL_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (map-set payment-schedules
+      { schedule-id: schedule-id }
+      (merge schedule { active: (not (get active schedule)) })
+    )
+    (ok (not (get active schedule)))
+  )
+)
+
+(define-public (update-schedule-amount (schedule-id uint) (new-amount uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? payment-schedules { schedule-id: schedule-id }) ERR_SCHEDULE_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id schedule) }) ERR_POOL_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+    (map-set payment-schedules
+      { schedule-id: schedule-id }
+      (merge schedule { expected-amount: new-amount })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-schedule-frequency (schedule-id uint) (new-frequency uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? payment-schedules { schedule-id: schedule-id }) ERR_SCHEDULE_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id schedule) }) ERR_POOL_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (asserts! (> new-frequency u0) ERR_INVALID_FREQUENCY)
+    (map-set payment-schedules
+      { schedule-id: schedule-id }
+      (merge schedule 
+        { 
+          frequency-blocks: new-frequency,
+          next-payment-block: (+ stacks-block-height new-frequency)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (trigger-auto-payments)
+  (let
+    (
+      (current-block stacks-block-height)
+    )
+    (ok (process-due-schedules current-block))
+  )
+)
+
+(define-private (create-and-pay-scheduled-bill (schedule-id uint) (bill-id uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? payment-schedules { schedule-id: schedule-id }) ERR_SCHEDULE_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id schedule) }) ERR_POOL_NOT_FOUND))
+      (expected-amount (get expected-amount schedule))
+    )
+    (map-set bills
+      { bill-id: bill-id }
+      {
+        pool-id: (get pool-id schedule),
+        amount: expected-amount,
+        due-date: stacks-block-height,
+        paid: false,
+        oracle-verified: true,
+        created-at: stacks-block-height
+      }
+    )
+    (var-set next-bill-id (+ bill-id u1))
+    (try! (as-contract (stx-transfer? expected-amount tx-sender (get admin pool))))
+    (map-set bills
+      { bill-id: bill-id }
+      {
+        pool-id: (get pool-id schedule),
+        amount: expected-amount,
+        due-date: stacks-block-height,
+        paid: true,
+        oracle-verified: true,
+        created-at: stacks-block-height
+      }
+    )
+    (map-set pools
+      { pool-id: (get pool-id schedule) }
+      (merge pool { total-balance: (- (get total-balance pool) expected-amount) })
+    )
+    (try! (distribute-bill-cost bill-id))
+    (let ((log-result (log-schedule-execution schedule-id bill-id expected-amount true)))
+      (ok true))
+  )
+)
+
+(define-private (process-due-schedules (current-block uint))
+  (begin
+    (ok true)
+  )
+)
+
+(define-private (log-schedule-execution (schedule-id uint) (bill-id uint) (amount uint) (success bool))
+  (let
+    (
+      (execution-id (+ (default-to u0 (get-last-execution-id schedule-id)) u1))
+    )
+    (map-set schedule-history
+      { schedule-id: schedule-id, execution-id: execution-id }
+      {
+        executed-at: stacks-block-height,
+        amount-paid: amount,
+        bill-id: bill-id,
+        success: success
+      }
+    )
+    (ok execution-id)
+  )
+)
+
+(define-private (get-active-schedule-for-pool (pool-id uint))
+  none
+)
+
+(define-private (get-last-execution-id (schedule-id uint))
+  (some u0)
+)
+
 (define-read-only (get-pool (pool-id uint))
   (map-get? pools { pool-id: pool-id })
 )
@@ -283,4 +499,37 @@
 
 (define-read-only (get-bill-count)
   (- (var-get next-bill-id) u1)
+)
+
+(define-read-only (get-payment-schedule (schedule-id uint))
+  (map-get? payment-schedules { schedule-id: schedule-id })
+)
+
+(define-read-only (get-schedule-history (schedule-id uint) (execution-id uint))
+  (map-get? schedule-history { schedule-id: schedule-id, execution-id: execution-id })
+)
+
+(define-read-only (get-schedule-count)
+  (- (var-get next-schedule-id) u1)
+)
+
+(define-read-only (is-schedule-due (schedule-id uint))
+  (match (map-get? payment-schedules { schedule-id: schedule-id })
+    schedule (and (get active schedule) (>= stacks-block-height (get next-payment-block schedule)))
+    false
+  )
+)
+
+(define-read-only (get-next-payment-block (schedule-id uint))
+  (match (map-get? payment-schedules { schedule-id: schedule-id })
+    schedule (some (get next-payment-block schedule))
+    none
+  )
+)
+
+(define-read-only (estimate-schedule-cost (schedule-id uint))
+  (match (map-get? payment-schedules { schedule-id: schedule-id })
+    schedule (some (get expected-amount schedule))
+    none
+  )
 )
