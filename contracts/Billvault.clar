@@ -15,6 +15,11 @@
 (define-constant ERR_SCHEDULE_NOT_DUE (err u113))
 (define-constant ERR_INVALID_FREQUENCY (err u114))
 (define-constant ERR_SCHEDULE_EXISTS (err u115))
+(define-constant ERR_INVALID_WEIGHT (err u116))
+(define-constant ERR_CALCULATION_ERROR (err u117))
+(define-constant ERR_NO_USAGE_DATA (err u118))
+(define-constant ERR_FAIRSHARE_NOT_ENABLED (err u119))
+(define-constant ERR_INVALID_ALGORITHM (err u120))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-bill-id uint u1)
@@ -92,6 +97,49 @@
     amount-paid: uint,
     bill-id: uint,
     success: bool
+  }
+)
+
+(define-map fairshare-config
+  { pool-id: uint }
+  {
+    usage-weight: uint,
+    contribution-weight: uint,
+    base-share-weight: uint,
+    algorithm-type: uint,
+    enabled: bool,
+    last-updated: uint
+  }
+)
+
+(define-map member-usage-totals
+  { pool-id: uint, member: principal }
+  {
+    total-usage: uint,
+    period-count: uint,
+    average-usage: uint,
+    last-calculated: uint
+  }
+)
+
+(define-map bill-distributions
+  { bill-id: uint, member: principal }
+  {
+    fair-share-amount: uint,
+    usage-portion: uint,
+    base-portion: uint,
+    contribution-adjustment: uint,
+    final-amount: uint
+  }
+)
+
+(define-map pool-analytics
+  { pool-id: uint }
+  {
+    total-usage-all-members: uint,
+    average-bill-amount: uint,
+    distribution-efficiency: uint,
+    last-analysis: uint
   }
 )
 
@@ -533,3 +581,295 @@
     none
   )
 )
+
+(define-public (configure-fairshare (pool-id uint) (usage-weight uint) (contribution-weight uint) (base-share-weight uint) (algorithm-type uint))
+  (let
+    (
+      (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (asserts! (<= usage-weight u100) ERR_INVALID_WEIGHT)
+    (asserts! (<= contribution-weight u100) ERR_INVALID_WEIGHT)
+    (asserts! (<= base-share-weight u100) ERR_INVALID_WEIGHT)
+    (asserts! (is-eq (+ usage-weight contribution-weight base-share-weight) u100) ERR_INVALID_WEIGHT)
+    (asserts! (<= algorithm-type u2) ERR_INVALID_ALGORITHM)
+    (map-set fairshare-config
+      { pool-id: pool-id }
+      {
+        usage-weight: usage-weight,
+        contribution-weight: contribution-weight,
+        base-share-weight: base-share-weight,
+        algorithm-type: algorithm-type,
+        enabled: true,
+        last-updated: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (toggle-fairshare (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (config (default-to 
+        { usage-weight: u50, contribution-weight: u30, base-share-weight: u20, algorithm-type: u0, enabled: false, last-updated: u0 }
+        (map-get? fairshare-config { pool-id: pool-id })
+      ))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (map-set fairshare-config
+      { pool-id: pool-id }
+      (merge config 
+        { 
+          enabled: (not (get enabled config)),
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (ok (not (get enabled config)))
+  )
+)
+
+(define-public (calculate-member-usage-totals (pool-id uint) (member principal))
+  (let
+    (
+      (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (current-totals (default-to 
+        { total-usage: u0, period-count: u0, average-usage: u0, last-calculated: u0 }
+        (map-get? member-usage-totals { pool-id: pool-id, member: member })
+      ))
+    )
+    (asserts! (is-some (map-get? pool-members { pool-id: pool-id, member: member })) ERR_NOT_MEMBER)
+    (let 
+      (
+        (usage-sum (aggregate-usage-for-member pool-id member))
+        (period-count (+ (get period-count current-totals) u1))
+        (new-average (if (> period-count u0) (/ usage-sum period-count) u0))
+      )
+      (map-set member-usage-totals
+        { pool-id: pool-id, member: member }
+        {
+          total-usage: usage-sum,
+          period-count: period-count,
+          average-usage: new-average,
+          last-calculated: stacks-block-height
+        }
+      )
+      (ok new-average)
+    )
+  )
+)
+
+(define-public (distribute-bill-with-fairshare (bill-id uint))
+  (let
+    (
+      (bill (unwrap! (map-get? bills { bill-id: bill-id }) ERR_BILL_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id bill) }) ERR_POOL_NOT_FOUND))
+      (config (unwrap! (map-get? fairshare-config { pool-id: (get pool-id bill) }) ERR_FAIRSHARE_NOT_ENABLED))
+      (bill-amount (get amount bill))
+    )
+    (asserts! (get enabled config) ERR_FAIRSHARE_NOT_ENABLED)
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (try! (calculate-pool-analytics (get pool-id bill)))
+    (try! (process-fairshare-distribution bill-id bill-amount config))
+    (ok true)
+  )
+)
+
+(define-public (update-algorithm-weights (pool-id uint) (new-usage-weight uint) (new-contribution-weight uint) (new-base-weight uint))
+  (let
+    (
+      (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (config (unwrap! (map-get? fairshare-config { pool-id: pool-id }) ERR_FAIRSHARE_NOT_ENABLED))
+    )
+    (asserts! (is-eq tx-sender (get admin pool)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (+ new-usage-weight new-contribution-weight new-base-weight) u100) ERR_INVALID_WEIGHT)
+    (map-set fairshare-config
+      { pool-id: pool-id }
+      (merge config
+        {
+          usage-weight: new-usage-weight,
+          contribution-weight: new-contribution-weight,
+          base-share-weight: new-base-weight,
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (aggregate-usage-for-member (pool-id uint) (member principal))
+  (let
+    (
+      (current-period stacks-block-height)
+      (period1 (default-to u0 (get usage-amount (map-get? usage-data { pool-id: pool-id, member: member, period: (- current-period u800) }))))
+      (period2 (default-to u0 (get usage-amount (map-get? usage-data { pool-id: pool-id, member: member, period: (- current-period u600) }))))
+      (period3 (default-to u0 (get usage-amount (map-get? usage-data { pool-id: pool-id, member: member, period: (- current-period u400) }))))
+      (period4 (default-to u0 (get usage-amount (map-get? usage-data { pool-id: pool-id, member: member, period: (- current-period u200) }))))
+      (period5 (default-to u0 (get usage-amount (map-get? usage-data { pool-id: pool-id, member: member, period: current-period }))))
+    )
+    (+ period1 period2 period3 period4 period5)
+  )
+)
+
+(define-private (process-fairshare-distribution (bill-id uint) (bill-amount uint) (config { usage-weight: uint, contribution-weight: uint, base-share-weight: uint, algorithm-type: uint, enabled: bool, last-updated: uint }))
+  (let
+    (
+      (bill (unwrap! (map-get? bills { bill-id: bill-id }) ERR_BILL_NOT_FOUND))
+      (pool (unwrap! (map-get? pools { pool-id: (get pool-id bill) }) ERR_POOL_NOT_FOUND))
+      (member-count (get current-members pool))
+    )
+    (if (> member-count u0)
+      (let 
+        (
+          (base-share (/ bill-amount member-count))
+          (analytics (default-to 
+            { total-usage-all-members: u1, average-bill-amount: bill-amount, distribution-efficiency: u100, last-analysis: stacks-block-height }
+            (map-get? pool-analytics { pool-id: (get pool-id bill) })
+          ))
+        )
+        (try! (distribute-to-active-members bill-id base-share config analytics))
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (distribute-to-active-members (bill-id uint) (base-share uint) (config { usage-weight: uint, contribution-weight: uint, base-share-weight: uint, algorithm-type: uint, enabled: bool, last-updated: uint }) (analytics { total-usage-all-members: uint, average-bill-amount: uint, distribution-efficiency: uint, last-analysis: uint }))
+  (let
+    (
+      (bill (unwrap! (map-get? bills { bill-id: bill-id }) ERR_BILL_NOT_FOUND))
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-pool-analytics (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (total-usage (calculate-total-pool-usage pool-id))
+    )
+    (map-set pool-analytics
+      { pool-id: pool-id }
+      {
+        total-usage-all-members: total-usage,
+        average-bill-amount: u0,
+        distribution-efficiency: u100,
+        last-analysis: stacks-block-height
+      }
+    )
+    (ok total-usage)
+  )
+)
+
+(define-private (calculate-total-pool-usage (pool-id uint))
+  (let
+    (
+      (current-period stacks-block-height)
+    )
+    u100
+  )
+)
+
+(define-private (calculate-member-fairshare (member principal) (pool-id uint) (base-share uint) (config { usage-weight: uint, contribution-weight: uint, base-share-weight: uint, algorithm-type: uint, enabled: bool, last-updated: uint }) (analytics { total-usage-all-members: uint, average-bill-amount: uint, distribution-efficiency: uint, last-analysis: uint }))
+  (let
+    (
+      (member-data (default-to 
+        { contribution: u0, usage-share: u0, joined-at: u0, active: true }
+        (map-get? pool-members { pool-id: pool-id, member: member })
+      ))
+      (usage-totals (default-to 
+        { total-usage: u0, period-count: u0, average-usage: u0, last-calculated: u0 }
+        (map-get? member-usage-totals { pool-id: pool-id, member: member })
+      ))
+    )
+    (if (get active member-data)
+      (let
+        (
+          (usage-factor (if (> (get total-usage-all-members analytics) u0)
+            (/ (* (get total-usage usage-totals) u100) (get total-usage-all-members analytics))
+            u0))
+          (contribution-factor (calculate-contribution-factor member pool-id))
+          (base-portion (/ (* base-share (get base-share-weight config)) u100))
+          (usage-portion (/ (* base-share usage-factor (get usage-weight config)) u10000))
+          (contribution-adjustment (/ (* base-share contribution-factor (get contribution-weight config)) u10000))
+        )
+        (+ base-portion usage-portion contribution-adjustment)
+      )
+      u0
+    )
+  )
+)
+
+(define-private (calculate-contribution-factor (member principal) (pool-id uint))
+  (let
+    (
+      (member-data (default-to 
+        { contribution: u0, usage-share: u0, joined-at: u0, active: true }
+        (map-get? pool-members { pool-id: pool-id, member: member })
+      ))
+      (pool (default-to 
+        { name: "", admin: tx-sender, max-members: u0, current-members: u0, total-balance: u0, utility-type: "", oracle: tx-sender, created-at: u0 }
+        (map-get? pools { pool-id: pool-id })
+      ))
+      (pool-total (get total-balance pool))
+    )
+    (if (> pool-total u0)
+      (/ (* (get contribution member-data) u100) pool-total)
+      u100)
+  )
+)
+
+(define-read-only (get-fairshare-config (pool-id uint))
+  (map-get? fairshare-config { pool-id: pool-id })
+)
+
+(define-read-only (get-member-usage-totals (pool-id uint) (member principal))
+  (map-get? member-usage-totals { pool-id: pool-id, member: member })
+)
+
+(define-read-only (get-bill-distribution (bill-id uint) (member principal))
+  (map-get? bill-distributions { bill-id: bill-id, member: member })
+)
+
+(define-read-only (get-pool-analytics (pool-id uint))
+  (map-get? pool-analytics { pool-id: pool-id })
+)
+
+(define-read-only (estimate-member-share (pool-id uint) (member principal) (bill-amount uint))
+  (let
+    (
+      (config (map-get? fairshare-config { pool-id: pool-id }))
+      (analytics (map-get? pool-analytics { pool-id: pool-id }))
+      (pool (map-get? pools { pool-id: pool-id }))
+    )
+    (match config
+      config-data
+        (match analytics
+          analytics-data
+            (match pool
+              pool-data
+                (let 
+                  (
+                    (base-share (/ bill-amount (get current-members pool-data)))
+                  )
+                  (some (calculate-member-fairshare member pool-id base-share config-data analytics-data))
+                )
+              none
+            )
+          none
+        )
+      none
+    )
+  )
+)
+
+(define-read-only (is-fairshare-enabled (pool-id uint))
+  (default-to false (get enabled (map-get? fairshare-config { pool-id: pool-id })))
+)
+
+
